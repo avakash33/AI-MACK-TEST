@@ -20,9 +20,19 @@ export interface TestResult {
   categoryBreakdown: Record<string, { correct: number; total: number }>;
 }
 
+export interface SavedTest {
+  id: string;
+  title: string;
+  questions: Question[];
+  config: TestConfig;
+  createdAt: number;
+  lastResult?: TestResult;
+}
+
 export enum AppState {
   IDLE = 'IDLE',
   ABOUT = 'ABOUT',
+  PROFILE = 'PROFILE',
   CONFIGURING = 'CONFIGURING',
   UPLOADING = 'UPLOADING',
   GENERATING = 'GENERATING',
