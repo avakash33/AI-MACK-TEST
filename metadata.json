@@ -1,0 +1,5 @@
+{
+  "name": "ExamAI - Professional Mock Test Generator",
+  "description": "An AI-powered testing platform that generates high-quality MCQ mock tests from PDF documents with real-time analytics, proctoring auto-detection, and timed sessions.",
+  "requestFramePermissions": []
+}
