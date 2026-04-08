@@ -6,6 +6,7 @@ import { TestInterface } from './components/TestInterface';
 import { ResultAnalytics } from './components/ResultAnalytics';
 import { generateMockTestFromContent } from './services/geminiService';
 import { AppState, Question, TestResult, TestConfig, SavedTest } from './types';
+import { translations, Language } from './translations';
 import { 
   onAuthStateChanged, 
   signInWithEmailAndPassword, 
@@ -13,6 +14,10 @@ import {
   signOut,
   updateProfile,
   updatePassword,
+  signInAnonymously,
+  sendPasswordResetEmail,
+  GoogleAuthProvider,
+  signInWithPopup,
   User 
 } from "firebase/auth";
 import { 
@@ -22,9 +27,62 @@ import {
   query, 
   orderBy, 
   doc, 
-  updateDoc 
+  updateDoc,
+  deleteDoc 
 } from "firebase/firestore";
 import { auth, db } from "./services/firebase";
+import { getDocFromServer } from "firebase/firestore";
+
+enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId: string | undefined;
+    email: string | null | undefined;
+    emailVerified: boolean | undefined;
+    isAnonymous: boolean | undefined;
+    tenantId: string | null | undefined;
+    providerInfo: {
+      providerId: string;
+      displayName: string | null;
+      email: string | null;
+      photoUrl: string | null;
+    }[];
+  }
+}
+
+const handleFirestoreError = (error: unknown, operationType: OperationType, path: string | null) => {
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: auth.currentUser?.uid,
+      email: auth.currentUser?.email,
+      emailVerified: auth.currentUser?.emailVerified,
+      isAnonymous: auth.currentUser?.isAnonymous,
+      tenantId: auth.currentUser?.tenantId,
+      providerInfo: auth.currentUser?.providerData.map(provider => ({
+        providerId: provider.providerId,
+        displayName: provider.displayName,
+        email: provider.email,
+        photoUrl: provider.photoURL
+      })) || []
+    },
+    operationType,
+    path
+  };
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  throw new Error(JSON.stringify(errInfo));
+};
 
 const PRESET_AVATARS = [
   "https://api.dicebear.com/7.x/avataaars/svg?seed=Felix",
@@ -38,12 +96,18 @@ const App: React.FC = () => {
   const [appState, setAppState] = useState<AppState>(AppState.IDLE);
   const [questions, setQuestions] = useState<Question[]>([]);
   const [result, setResult] = useState<TestResult | null>(null);
-  const [showAuthModal, setShowAuthModal] = useState<'signin' | 'signup' | null>(null);
+  const [showAuthModal, setShowAuthModal] = useState<'signin' | 'signup' | 'forgot' | null>(null);
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
+  const [resetSent, setResetSent] = useState(false);
   const [userTests, setUserTests] = useState<SavedTest[]>([]);
+  const [isLocalMode, setIsLocalMode] = useState(false);
+  const [showReview, setShowReview] = useState(false);
   const [activeTestId, setActiveTestId] = useState<string | null>(null);
+  const [generationProgress, setGenerationProgress] = useState({ current: 0, total: 0 });
+  const [generationError, setGenerationError] = useState<string | null>(null);
+  const [language, setLanguage] = useState<Language>('en');
   
   // Profile Update State
   const [profileName, setProfileName] = useState({ first: '', last: '' });
@@ -58,6 +122,7 @@ const App: React.FC = () => {
     lastName: ''
   });
   const configRef = useRef<HTMLDivElement>(null);
+  const libraryRef = useRef<HTMLDivElement>(null);
   const avatarInputRef = useRef<HTMLInputElement>(null);
   
   const [config, setConfig] = useState<TestConfig>({
@@ -68,71 +133,179 @@ const App: React.FC = () => {
   });
 
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (user) => {
-      setCurrentUser(user);
+    async function testConnection() {
+      try {
+        // Simple test to check if Firestore is reachable and configured correctly
+        await getDocFromServer(doc(db, 'test', 'connection'));
+      } catch (error) {
+        if (error instanceof Error && error.message.includes('the client is offline')) {
+          console.error("Please check your Firebase configuration. The client is offline.");
+        }
+      }
+    }
+    testConnection();
+  }, []);
+
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, async (user) => {
       if (user) {
+        setCurrentUser(user);
+        setIsLocalMode(false);
         if (user.displayName) {
           const parts = user.displayName.split(' ');
           setProfileName({ first: parts[0] || '', last: parts.slice(1).join(' ') || '' });
+        } else if (user.isAnonymous) {
+          setProfileName({ first: 'Guest', last: 'User' });
         }
-        fetchUserTests(user.uid);
+        loadUserTests(user.uid);
       } else {
-        setUserTests([]);
+        // Automatically sign in as guest if no user is present
+        try {
+          await signInAnonymously(auth);
+        } catch (err: any) {
+          if (err.code === 'auth/admin-restricted-operation' || err.code === 'auth/operation-not-allowed') {
+            console.warn("Anonymous Auth disabled or restricted. Falling back to Local Guest Mode.");
+            setIsLocalMode(true);
+            setProfileName({ first: 'Guest', last: 'User' });
+            loadUserTests('');
+          } else {
+            console.error("Failed to sign in anonymously:", err);
+          }
+        }
       }
     });
     return () => unsubscribe();
   }, []);
 
-  const fetchUserTests = async (uid: string) => {
+  const loadUserTests = async (uid: string) => {
+    if (!uid) {
+      setUserTests([]);
+      return;
+    }
+
+    const localTestsJson = localStorage.getItem('examai_local_tests');
+    const localTests: SavedTest[] = localTestsJson ? JSON.parse(localTestsJson) : [];
+
+    const path = `users/${uid}/tests`;
     try {
-      const q = query(collection(db, "users", uid, "tests"), orderBy("createdAt", "desc"));
+      const q = query(collection(db, path), orderBy("createdAt", "desc"));
       const querySnapshot = await getDocs(q);
-      const tests: SavedTest[] = [];
+      const firestoreTests: SavedTest[] = [];
       querySnapshot.forEach((doc) => {
-        tests.push({ id: doc.id, ...doc.data() } as SavedTest);
+        firestoreTests.push({ id: doc.id, ...doc.data() } as SavedTest);
       });
-      setUserTests(tests);
+      
+      // Merge local tests with firestore tests, prioritizing firestore
+      const mergedTests = [...firestoreTests];
+      localTests.forEach(lt => {
+        if (!mergedTests.find(ft => ft.id === lt.id)) {
+          mergedTests.push(lt);
+        }
+      });
+
+      setUserTests(mergedTests.sort((a, b) => b.createdAt - a.createdAt));
     } catch (err) {
-      console.error("Error fetching tests:", err);
+      // If firestore fails, at least show local tests
+      setUserTests(localTests);
+      handleFirestoreError(err, OperationType.LIST, path);
+    }
+  };
+
+  const deleteTest = async (testId: string) => {
+    if (!currentUser) return;
+
+    if (testId.startsWith('local_')) {
+      const localTests = JSON.parse(localStorage.getItem('examai_local_tests') || '[]');
+      const updatedTests = localTests.filter((t: any) => t.id !== testId);
+      localStorage.setItem('examai_local_tests', JSON.stringify(updatedTests));
+      loadUserTests(currentUser.uid);
+      return;
+    }
+
+    const path = `users/${currentUser.uid}/tests/${testId}`;
+    try {
+      await deleteDoc(doc(db, path));
+      loadUserTests(currentUser.uid);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, path);
     }
   };
 
   const scrollToConfig = () => {
-    if (!currentUser) {
-      setShowAuthModal('signin');
-      return;
-    }
     configRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
 
   const handleFileUpload = async (base64: string, fileName: string) => {
-    if (!currentUser) {
-      setShowAuthModal('signin');
-      return;
-    }
     setAppState(AppState.GENERATING);
+    setGenerationError(null);
+    setShowReview(false);
+    setGenerationProgress({ current: 0, total: config.questionCount });
     try {
-      const generatedQuestions = await generateMockTestFromContent(base64, config.questionCount, config.topics);
+      const generatedQuestions = await generateMockTestFromContent(
+        base64, 
+        config.questionCount, 
+        config.topics,
+        (current, total) => setGenerationProgress({ current, total })
+      );
+
+      if (!generatedQuestions || generatedQuestions.length === 0) {
+        throw new Error("AI failed to generate any questions. Please try again with a different PDF or topics.");
+      }
       
       const testTitle = fileName.replace('.pdf', '');
       const newTestConfig = { ...config, title: testTitle };
       
-      // Save to Firestore
-      const docRef = await addDoc(collection(db, "users", currentUser.uid, "tests"), {
+      const newTestData = {
         title: testTitle,
         questions: generatedQuestions,
         config: newTestConfig,
         createdAt: Date.now()
-      });
+      };
 
-      setQuestions(generatedQuestions);
-      setConfig(newTestConfig);
-      setActiveTestId(docRef.id);
-      setAppState(AppState.TESTING);
-      fetchUserTests(currentUser.uid); // Refresh history
-    } catch (err) {
-      alert("Failed to generate test. Please try another PDF or fewer questions.");
-      setAppState(AppState.IDLE);
+      if (!currentUser) {
+        const localId = `local_${Date.now()}`;
+        const localTests = JSON.parse(localStorage.getItem('examai_local_tests') || '[]');
+        const newLocalTest = { id: localId, ...newTestData };
+        localStorage.setItem('examai_local_tests', JSON.stringify([newLocalTest, ...localTests]));
+
+        setQuestions(generatedQuestions);
+        setConfig(newTestConfig);
+        setActiveTestId(localId);
+        setAppState(AppState.READY);
+        return;
+      }
+
+      // Save to Firestore
+      const path = `users/${currentUser.uid}/tests`;
+      try {
+        const docRef = await addDoc(collection(db, path), {
+          title: testTitle,
+          questions: generatedQuestions,
+          config: newTestConfig,
+          createdAt: Date.now()
+        });
+
+        setQuestions(generatedQuestions);
+        setConfig(newTestConfig);
+        setActiveTestId(docRef.id);
+        setAppState(AppState.READY);
+        loadUserTests(currentUser.uid); // Refresh history
+      } catch (err) {
+        handleFirestoreError(err, OperationType.CREATE, path);
+      }
+    } catch (err: any) {
+      console.error("Generation error:", err);
+      let errorMessage = "Failed to generate test. Please try another PDF or fewer questions.";
+      
+      if (err.message?.toLowerCase().includes("safety")) {
+        errorMessage = "The content of this PDF was flagged by safety filters. Please try another document.";
+      } else if (err.message?.includes("quota") || err.message?.includes("429")) {
+        errorMessage = "AI service is currently busy. Please wait a moment and try again.";
+      } else if (err.message?.toLowerCase().includes("format") || err.message?.toLowerCase().includes("invalid")) {
+        errorMessage = "The PDF format seems invalid or unsupported. Please check your file.";
+      }
+      
+      setGenerationError(errorMessage);
     }
   };
 
@@ -141,6 +314,28 @@ const App: React.FC = () => {
     setConfig(test.config);
     setActiveTestId(test.id);
     setAppState(AppState.TESTING);
+  };
+
+  const handleForgotPassword = async () => {
+    if (!authData.email) {
+      setAuthError("Please enter your email address.");
+      return;
+    }
+
+    setAuthLoading(true);
+    setAuthError(null);
+    try {
+      await sendPasswordResetEmail(auth, authData.email);
+      setResetSent(true);
+    } catch (err: any) {
+      let message = err.message;
+      if (err.code === 'auth/user-not-found') {
+        message = "No account found with this email.";
+      }
+      setAuthError(message);
+    } finally {
+      setAuthLoading(false);
+    }
   };
 
   const handleAuthAction = async () => {
@@ -174,6 +369,29 @@ const App: React.FC = () => {
         message = "Invalid email or password.";
       } else if (err.code === 'auth/email-already-in-use') {
         message = "Email is already registered.";
+      } else if (err.code === 'auth/operation-not-allowed') {
+        message = "Authentication method not enabled. Please go to Firebase Console > Authentication > Sign-in method and enable 'Email/Password'.";
+      }
+      setAuthError(message);
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const handleGoogleSignIn = async () => {
+    setAuthLoading(true);
+    setAuthError(null);
+    try {
+      const provider = new GoogleAuthProvider();
+      await signInWithPopup(auth, provider);
+      setShowAuthModal(null);
+    } catch (err: any) {
+      console.error("Google Sign-In Error:", err);
+      let message = err.message;
+      if (err.code === 'auth/popup-closed-by-user') {
+        message = "Sign-in popup was closed before completion.";
+      } else if (err.code === 'auth/operation-not-allowed') {
+        message = "Google Sign-In is not enabled. Please enable it in the Firebase Console.";
       }
       setAuthError(message);
     } finally {
@@ -268,16 +486,26 @@ const App: React.FC = () => {
       categoryBreakdown: categoryMap
     };
 
-    // Update result in Firestore if test was saved
-    if (currentUser && activeTestId) {
-      try {
-        const testDocRef = doc(db, "users", currentUser.uid, "tests", activeTestId);
-        await updateDoc(testDocRef, {
-          lastResult: finalResult
-        });
-        fetchUserTests(currentUser.uid); // Refresh history list
-      } catch (err) {
-        console.error("Error saving result:", err);
+    // Update result in Firestore or Local Storage
+    if (activeTestId) {
+      if (activeTestId.startsWith('local_') || isLocalMode || !currentUser) {
+        const localTests: SavedTest[] = JSON.parse(localStorage.getItem('examai_local_tests') || '[]');
+        const updatedTests = localTests.map(t => 
+          t.id === activeTestId ? { ...t, lastResult: finalResult } : t
+        );
+        localStorage.setItem('examai_local_tests', JSON.stringify(updatedTests));
+        loadUserTests(currentUser?.uid || '');
+      } else if (currentUser) {
+        const path = `users/${currentUser.uid}/tests/${activeTestId}`;
+        try {
+          const testDocRef = doc(db, path);
+          await updateDoc(testDocRef, {
+            lastResult: finalResult
+          });
+          loadUserTests(currentUser.uid); // Refresh history list
+        } catch (err) {
+          handleFirestoreError(err, OperationType.UPDATE, path);
+        }
       }
     }
 
@@ -289,7 +517,15 @@ const App: React.FC = () => {
     setAppState(AppState.IDLE);
     setQuestions([]);
     setResult(null);
+    setShowReview(false);
     setActiveTestId(null);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const retakeTest = () => {
+    setResult(null);
+    setShowReview(false);
+    setAppState(AppState.TESTING);
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
@@ -308,17 +544,37 @@ const App: React.FC = () => {
     setAppState(AppState.PROFILE);
   };
 
+  const navigateHistory = () => {
+    setAppState(AppState.HISTORY);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const t = translations[language];
+
   return (
     <Layout 
       onHome={navigateHome} 
       onAbout={navigateAbout}
+      onHistory={navigateHistory}
       onProfile={navigateProfile}
       onSignIn={() => { setAuthError(null); setShowAuthModal('signin'); }}
       onSignUp={() => { setAuthError(null); setShowAuthModal('signup'); }}
       onSignOut={handleSignOut}
       currentState={appState}
       user={currentUser}
+      isLocalMode={isLocalMode}
+      language={language}
+      onLanguageChange={setLanguage}
     >
+      {authError && !showAuthModal && (
+        <div className="max-w-4xl mx-auto mt-4 p-4 bg-red-50 border border-red-100 rounded-2xl flex items-center justify-between animate-in slide-in-from-top-4 duration-300">
+          <div className="flex items-center gap-3">
+            <div className="w-8 h-8 bg-red-100 text-red-600 rounded-lg flex items-center justify-center text-lg">⚠️</div>
+            <p className="text-sm font-bold text-red-600">{authError}</p>
+          </div>
+          <button onClick={() => setAuthError(null)} className="text-red-400 hover:text-red-600 font-bold text-xl px-2">×</button>
+        </div>
+      )}
       {showAuthModal && (
         <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-in fade-in duration-300">
           <div className="bg-white rounded-[2rem] md:rounded-[2.5rem] p-6 md:p-10 max-w-md w-full shadow-2xl relative max-h-[90vh] overflow-y-auto">
@@ -333,14 +589,21 @@ const App: React.FC = () => {
             </button>
             <div className="text-center mb-8">
                <h3 className="text-2xl md:text-3xl font-black text-slate-800 mb-2">
-                 {showAuthModal === 'signin' ? 'Welcome Back' : 'Join ExamAI'}
+                 {showAuthModal === 'signin' ? t.nav.signIn : showAuthModal === 'signup' ? t.nav.signUp : 'Reset Password'}
                </h3>
-               <p className="text-slate-500 font-medium">Please enter your details to continue.</p>
+               <p className="text-slate-500 font-medium">
+                 {showAuthModal === 'forgot' ? 'Enter your email to receive a reset link.' : 'Please enter your details to continue.'}
+               </p>
             </div>
             <div className="space-y-4">
                {authError && (
                  <div className="bg-red-50 text-red-600 text-xs font-bold p-4 rounded-xl border border-red-100">
                    {authError}
+                 </div>
+               )}
+               {resetSent && (
+                 <div className="bg-green-50 text-green-600 text-xs font-bold p-4 rounded-xl border border-green-100">
+                   Password reset link sent! Please check your inbox.
                  </div>
                )}
                {showAuthModal === 'signup' && (
@@ -368,33 +631,85 @@ const App: React.FC = () => {
                  onChange={(e) => setAuthData({...authData, email: e.target.value})}
                  className="w-full bg-slate-50 border-2 border-slate-100 rounded-2xl px-6 py-4 outline-none focus:border-indigo-500 transition-all text-base" 
                />
-               <input 
-                 type="password" 
-                 placeholder="Password" 
-                 value={authData.password}
-                 onChange={(e) => setAuthData({...authData, password: e.target.value})}
-                 className="w-full bg-slate-50 border-2 border-slate-100 rounded-2xl px-6 py-4 outline-none focus:border-indigo-500 transition-all text-base" 
-               />
+               {showAuthModal !== 'forgot' && (
+                 <input 
+                   type="password" 
+                   placeholder="Password" 
+                   value={authData.password}
+                   onChange={(e) => setAuthData({...authData, password: e.target.value})}
+                   className="w-full bg-slate-50 border-2 border-slate-100 rounded-2xl px-6 py-4 outline-none focus:border-indigo-500 transition-all text-base" 
+                 />
+               )}
+               {showAuthModal === 'signin' && (
+                 <div className="text-right">
+                   <button 
+                     onClick={() => {
+                       setAuthError(null);
+                       setResetSent(false);
+                       setShowAuthModal('forgot');
+                     }}
+                     className="text-indigo-600 text-xs font-bold hover:underline"
+                   >
+                     Forgot Password?
+                   </button>
+                 </div>
+               )}
                <button 
-                 disabled={authLoading}
-                 onClick={handleAuthAction}
+                 disabled={authLoading || (showAuthModal === 'forgot' && resetSent)}
+                 onClick={showAuthModal === 'forgot' ? handleForgotPassword : handleAuthAction}
                  className="w-full bg-indigo-600 text-white py-4 rounded-2xl font-bold text-lg hover:bg-indigo-700 transition-all shadow-xl flex items-center justify-center disabled:opacity-50 active:scale-[0.98]"
                >
                  {authLoading ? (
                    <div className="w-6 h-6 border-4 border-white border-t-transparent rounded-full animate-spin"></div>
                  ) : (
-                   showAuthModal === 'signin' ? 'Sign In' : 'Create Account'
+                   showAuthModal === 'signin' ? 'Sign In' : showAuthModal === 'signup' ? 'Create Account' : 'Send Reset Link'
                  )}
                </button>
+
+               {showAuthModal !== 'forgot' && (
+                 <>
+                   <div className="relative py-4">
+                     <div className="absolute inset-0 flex items-center">
+                       <div className="w-full border-t border-slate-200"></div>
+                     </div>
+                     <div className="relative flex justify-center text-xs uppercase">
+                       <span className="bg-white px-2 text-slate-400 font-bold">Or continue with</span>
+                     </div>
+                   </div>
+
+                   <button 
+                     type="button"
+                     disabled={authLoading}
+                     onClick={handleGoogleSignIn}
+                     className="w-full bg-white text-slate-700 border-2 border-slate-100 py-4 rounded-2xl font-bold text-lg hover:bg-slate-50 transition-all flex items-center justify-center gap-3 disabled:opacity-50 active:scale-[0.98]"
+                   >
+                     <svg className="w-6 h-6" viewBox="0 0 24 24">
+                       <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
+                       <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+                       <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l3.66-2.84z"/>
+                       <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
+                     </svg>
+                     Google
+                   </button>
+                 </>
+               )}
+
                <div className="text-center pt-2">
                  <button 
                    onClick={() => {
                      setAuthError(null);
-                     setShowAuthModal(showAuthModal === 'signin' ? 'signup' : 'signin');
+                     setResetSent(false);
+                     if (showAuthModal === 'forgot') {
+                       setShowAuthModal('signin');
+                     } else {
+                       setShowAuthModal(showAuthModal === 'signin' ? 'signup' : 'signin');
+                     }
                    }}
                    className="text-indigo-600 text-sm font-bold hover:underline py-2"
                  >
-                   {showAuthModal === 'signin' ? "Don't have an account? Sign Up" : "Already have an account? Sign In"}
+                   {showAuthModal === 'signin' ? "Don't have an account? Sign Up" : 
+                    showAuthModal === 'signup' ? "Already have an account? Sign In" : 
+                    "Back to Sign In"}
                  </button>
                </div>
             </div>
@@ -402,164 +717,238 @@ const App: React.FC = () => {
         </div>
       )}
 
-      {appState === AppState.IDLE && (
+      {(appState === AppState.IDLE || appState === AppState.GENERATING) && (
         <div className="animate-in fade-in zoom-in duration-500">
-          <div className="text-center py-12 md:py-24 max-w-5xl mx-auto px-4">
-            <div className="inline-block px-4 py-1.5 mb-6 rounded-full bg-indigo-50 text-indigo-600 text-xs md:sm font-bold border border-indigo-100 uppercase tracking-widest">
-              Smart Exam Preparation
-            </div>
-            <h1 className="text-4xl md:text-8xl font-black text-slate-800 mb-6 md:mb-10 leading-tight tracking-tight">
-              Master Any Subject <br />
-              <span className="bg-clip-text text-transparent bg-gradient-to-r from-indigo-600 to-violet-600">With AI Mock Tests</span>
-            </h1>
-            <p className="text-lg md:text-2xl text-slate-500 leading-relaxed max-w-2xl mx-auto mb-10 md:mb-12">
-              The smartest way to prepare. Upload your materials and generate professional-grade exams in seconds.
-            </p>
-            <div className="flex flex-col sm:flex-row items-center justify-center gap-4">
-              <button 
-                onClick={scrollToConfig}
-                className="w-full sm:w-auto bg-indigo-600 text-white px-10 py-5 rounded-[2rem] font-black text-lg md:text-xl hover:bg-indigo-700 transition-all shadow-2xl hover:-translate-y-1 active:translate-y-0 active:scale-95"
-              >
-                Create New Test
-              </button>
-              <button 
-                onClick={navigateAbout}
-                className="w-full sm:w-auto bg-white text-slate-700 border-2 border-slate-100 px-10 py-5 rounded-[2rem] font-black text-lg md:text-xl hover:bg-slate-50 transition-all active:scale-95"
-              >
-                Learn More
-              </button>
-            </div>
-          </div>
-
-          {currentUser && userTests.length > 0 && (
-            <div className="max-w-6xl mx-auto mb-20 px-4">
-               <div className="flex items-center justify-between mb-8">
-                  <h3 className="text-3xl font-black text-slate-800">My Library</h3>
-                  <p className="text-slate-400 font-bold text-sm uppercase">{userTests.length} tests saved</p>
-               </div>
-               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                  {userTests.map(test => (
-                    <div key={test.id} className="bg-white rounded-3xl p-6 shadow-xl border border-slate-100 hover:shadow-2xl transition-all group flex flex-col justify-between">
-                       <div>
-                          <div className="flex justify-between items-start mb-4">
-                             <div className="w-10 h-10 bg-indigo-50 text-indigo-600 rounded-xl flex items-center justify-center font-bold">📄</div>
-                             <span className="text-[10px] font-black text-slate-300 uppercase bg-slate-50 px-2 py-1 rounded">
-                                {new Date(test.createdAt).toLocaleDateString()}
-                             </span>
-                          </div>
-                          <h4 className="text-xl font-bold text-slate-800 mb-2 truncate group-hover:text-indigo-600 transition-colors">{test.title}</h4>
-                          <div className="flex gap-2 mb-4">
-                             <span className="text-xs font-bold text-slate-400">{test.questions.length} Questions</span>
-                             <span className="text-xs font-bold text-slate-400">•</span>
-                             <span className="text-xs font-bold text-slate-400">{test.config.duration} Mins</span>
-                          </div>
-                          {test.lastResult && (
-                            <div className="mb-4 p-3 bg-green-50 rounded-xl border border-green-100 flex items-center justify-between">
-                               <span className="text-[10px] font-bold text-green-600 uppercase">Last Score</span>
-                               <span className="text-lg font-black text-green-600">{Math.round((test.lastResult.score / test.lastResult.totalQuestions) * 100)}%</span>
-                            </div>
-                          )}
-                       </div>
-                       <button 
-                        onClick={() => startSavedTest(test)}
-                        className="w-full bg-slate-50 text-slate-700 py-3 rounded-2xl font-bold hover:bg-indigo-600 hover:text-white transition-all active:scale-95"
-                       >
-                         Start Test Now
-                       </button>
-                    </div>
-                  ))}
-               </div>
+          {appState === AppState.IDLE && (
+            <div className="text-center py-12 md:py-20 max-w-4xl mx-auto px-4">
+              <div className="inline-block px-4 py-1.5 mb-6 rounded-full bg-indigo-50 text-indigo-600 text-xs md:sm font-bold border border-indigo-100 uppercase tracking-widest">
+                {t.hero.badge}
+              </div>
+              <h1 className="text-4xl md:text-6xl lg:text-7xl font-black text-slate-800 mb-6 md:mb-10 leading-tight tracking-tight">
+                {t.hero.title1} <br />
+                <span className="bg-clip-text text-transparent bg-gradient-to-r from-indigo-600 to-violet-600">{t.hero.title2}</span>
+              </h1>
+              <p className="text-lg md:text-xl text-slate-500 leading-relaxed max-w-2xl mx-auto mb-10 md:mb-12">
+                {t.hero.subtitle}
+              </p>
+              <div className="flex flex-col sm:flex-row items-center justify-center gap-4">
+                <button 
+                  onClick={scrollToConfig}
+                  className="w-full sm:w-auto bg-indigo-600 text-white px-10 py-5 rounded-[2rem] font-black text-lg md:text-xl hover:bg-indigo-700 transition-all shadow-2xl hover:-translate-y-1 active:translate-y-0 active:scale-95"
+                >
+                  {t.hero.ctaPrimary}
+                </button>
+                <button 
+                  onClick={navigateAbout}
+                  className="w-full sm:w-auto bg-white text-slate-700 border-2 border-slate-100 px-10 py-5 rounded-[2rem] font-black text-lg md:text-xl hover:bg-slate-50 transition-all active:scale-95"
+                >
+                  {t.hero.ctaSecondary}
+                </button>
+              </div>
             </div>
           )}
-          
-          <div ref={configRef} className="max-w-4xl mx-auto bg-white p-6 md:p-14 rounded-[2rem] md:rounded-[3rem] shadow-2xl border border-slate-100 mb-20 scroll-mt-24">
+
+          <div ref={configRef} className="max-w-4xl mx-auto bg-white p-6 md:p-10 rounded-[2rem] md:rounded-[3rem] shadow-2xl border border-slate-100 mb-20 scroll-mt-24">
             <div className="flex flex-col md:flex-row items-center justify-between mb-8 md:mb-12 gap-6">
               <div className="flex items-center gap-4">
                  <div className="w-12 h-12 bg-indigo-600 rounded-2xl flex items-center justify-center text-white text-2xl">✨</div>
                  <div>
-                    <h3 className="text-xl md:text-2xl font-black text-slate-800">New Custom Test</h3>
-                    <p className="text-sm md:text-base text-slate-500 font-medium">Upload a document to generate a new persistent mock test.</p>
+                    <h3 className="text-xl md:text-2xl font-black text-slate-800">{t.config.title}</h3>
+                    <p className="text-sm md:text-base text-slate-500 font-medium">{t.config.subtitle}</p>
                  </div>
               </div>
             </div>
             
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6 md:gap-8 mb-10">
                <div>
-                  <label className="block text-[10px] md:text-xs font-black text-slate-400 uppercase tracking-widest mb-3">Question Volume</label>
+                  <label className="block text-[10px] md:text-xs font-black text-slate-400 uppercase tracking-widest mb-3">{t.config.volume}</label>
                   <div className="relative">
                     <select 
-                      className="w-full appearance-none bg-slate-50 border-2 border-slate-100 rounded-2xl px-6 py-4 font-bold text-slate-700 outline-none focus:border-indigo-500 focus:bg-white transition-all text-base"
+                      className="w-full appearance-none bg-slate-50 border-2 border-slate-100 rounded-2xl px-6 py-4 font-bold text-slate-700 outline-none focus:border-indigo-500 focus:bg-white transition-all text-base disabled:opacity-50"
                       value={config.questionCount}
                       onChange={(e) => setConfig({...config, questionCount: parseInt(e.target.value)})}
+                      disabled={appState === AppState.GENERATING}
                     >
-                      <option value={10}>10 Questions (Short)</option>
-                      <option value={25}>25 Questions (Standard)</option>
-                      <option value={50}>50 Questions (Long)</option>
-                      <option value={100}>100 Questions (Endurance)</option>
+                      <option value={10}>10 Questions</option>
+                      <option value={25}>25 Questions</option>
+                      <option value={50}>50 Questions</option>
+                      <option value={100}>100 Questions</option>
+                      <option value={500}>500 Questions</option>
+                      <option value={1000}>1000 Questions</option>
                     </select>
                     <div className="absolute right-6 top-1/2 -translate-y-1/2 pointer-events-none text-slate-400">▼</div>
                   </div>
                </div>
 
                <div>
-                  <label className="block text-[10px] md:text-xs font-black text-slate-400 uppercase tracking-widest mb-3">Time Limit</label>
+                  <label className="block text-[10px] md:text-xs font-black text-slate-400 uppercase tracking-widest mb-3">{t.config.time}</label>
                   <div className="relative">
                     <select 
-                       className="w-full appearance-none bg-slate-50 border-2 border-slate-100 rounded-2xl px-6 py-4 font-bold text-slate-700 outline-none focus:border-indigo-500 focus:bg-white transition-all text-base"
+                       className="w-full appearance-none bg-slate-50 border-2 border-slate-100 rounded-2xl px-6 py-4 font-bold text-slate-700 outline-none focus:border-indigo-500 focus:bg-white transition-all text-base disabled:opacity-50"
                        value={config.duration}
                        onChange={(e) => setConfig({...config, duration: parseInt(e.target.value)})}
+                       disabled={appState === AppState.GENERATING}
                     >
                       <option value={15}>15 Minutes</option>
                       <option value={30}>30 Minutes</option>
                       <option value={60}>1 Hour</option>
                       <option value={120}>2 Hours</option>
+                      <option value={180}>3 Hours</option>
+                      <option value={300}>5 Hours</option>
                     </select>
                     <div className="absolute right-6 top-1/2 -translate-y-1/2 pointer-events-none text-slate-400">▼</div>
                   </div>
                </div>
 
                <div className="md:col-span-2">
-                  <label className="block text-[10px] md:text-xs font-black text-slate-400 uppercase tracking-widest mb-3">Topic Focus (Optional)</label>
+                  <label className="block text-[10px] md:text-xs font-black text-slate-400 uppercase tracking-widest mb-3">{t.config.topics}</label>
                   <input 
                     type="text"
-                    placeholder="Focus AI on specific chapters or concepts..."
-                    className="w-full bg-slate-50 border-2 border-slate-100 rounded-2xl px-6 py-4 font-bold text-slate-700 outline-none focus:border-indigo-500 focus:bg-white transition-all placeholder:text-slate-300 text-base"
+                    placeholder={t.config.topicsPlaceholder}
+                    className="w-full bg-slate-50 border-2 border-slate-100 rounded-2xl px-6 py-4 font-bold text-slate-700 outline-none focus:border-indigo-500 focus:bg-white transition-all placeholder:text-slate-300 text-base disabled:opacity-50"
                     value={config.topics}
                     onChange={(e) => setConfig({...config, topics: e.target.value})}
+                    disabled={appState === AppState.GENERATING}
                   />
                </div>
             </div>
 
-            <FileUpload onFileSelect={handleFileUpload} isLoading={false} />
+            <FileUpload 
+              onFileSelect={handleFileUpload} 
+              isLoading={appState === AppState.GENERATING} 
+              language={language} 
+              progress={generationProgress}
+            />
+
+            {generationError && (
+              <div className="mt-8 p-6 bg-red-50 border-2 border-red-100 rounded-3xl animate-in slide-in-from-top-4 duration-500">
+                <div className="flex items-center gap-4 text-red-600 mb-2">
+                  <span className="text-xl">⚠️</span>
+                  <h4 className="font-black uppercase tracking-widest text-xs">{t.generating.failed}</h4>
+                </div>
+                <p className="text-red-500 font-bold text-sm">{generationError}</p>
+                <button 
+                  onClick={() => setGenerationError(null)}
+                  className="mt-4 text-red-600 font-black text-xs uppercase tracking-widest hover:underline"
+                >
+                  Dismiss
+                </button>
+              </div>
+            )}
           </div>
+        </div>
+      )}
+
+      {appState === AppState.HISTORY && currentUser && !currentUser.isAnonymous && (
+        <div className="max-w-5xl mx-auto py-8 md:py-16 animate-in fade-in slide-in-from-bottom-4 duration-500 px-4">
+           <div className="flex items-center justify-between mb-8">
+              <h3 className="text-3xl md:text-4xl font-black text-slate-800">
+                {t.library.myLibrary}
+              </h3>
+              <p className="text-slate-400 font-bold text-sm uppercase">{userTests.length} {t.library.testsSaved}</p>
+           </div>
+           {userTests.length > 0 ? (
+             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                {userTests.map(test => (
+                  <div key={test.id} className="group bg-white rounded-[2rem] p-6 shadow-xl border border-slate-100 hover:border-indigo-200 transition-all hover:-translate-y-1 flex flex-col justify-between relative">
+                     <button 
+                       onClick={(e) => {
+                         e.stopPropagation();
+                         deleteTest(test.id);
+                       }}
+                       className="absolute top-4 right-4 p-2 text-slate-300 hover:text-red-500 transition-colors z-10"
+                       title="Delete Test"
+                     >
+                       <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                       </svg>
+                     </button>
+                     <div>
+                        <div className="flex justify-between items-start mb-4">
+                           <div className="w-10 h-10 bg-indigo-50 text-indigo-600 rounded-xl flex items-center justify-center font-bold">📄</div>
+                           <span className="text-[10px] font-black text-slate-300 uppercase bg-slate-50 px-2 py-1 rounded">
+                              {new Date(test.createdAt).toLocaleDateString()}
+                           </span>
+                        </div>
+                        <h4 className="text-xl font-bold text-slate-800 mb-2 truncate group-hover:text-indigo-600 transition-colors">{test.title}</h4>
+                        <div className="flex gap-2 mb-4">
+                           <span className="text-xs font-bold text-slate-400">{test.questions.length} {t.ready.questions}</span>
+                           <span className="text-xs font-bold text-slate-400">•</span>
+                           <span className="text-xs font-bold text-slate-400">{test.config.duration} Mins</span>
+                        </div>
+                        {test.lastResult && (
+                          <div className="mb-4 p-3 bg-green-50 rounded-xl border border-green-100 flex items-center justify-between">
+                             <span className="text-[10px] font-bold text-green-600 uppercase">{t.results.accuracy}</span>
+                             <span className="text-lg font-black text-green-600">{Math.round((test.lastResult.score / test.lastResult.totalQuestions) * 100)}%</span>
+                          </div>
+                        )}
+                     </div>
+                     <button 
+                      onClick={() => startSavedTest(test)}
+                      className="w-full bg-slate-50 text-slate-700 py-3 rounded-2xl font-bold hover:bg-indigo-600 hover:text-white transition-all active:scale-95"
+                     >
+                       {t.library.startNow}
+                     </button>
+                  </div>
+                ))}
+             </div>
+           ) : (
+             <div className="bg-white rounded-[2rem] p-12 text-center border-2 border-dashed border-slate-100">
+                <div className="w-16 h-16 bg-slate-50 rounded-2xl flex items-center justify-center text-2xl mx-auto mb-4">📚</div>
+                <h4 className="text-xl font-bold text-slate-800 mb-2">{t.library.emptyTitle}</h4>
+                <p className="text-slate-500 mb-6">{t.library.emptySub}</p>
+                <button 
+                  onClick={navigateHome}
+                  className="text-indigo-600 font-bold hover:underline"
+                >
+                  {t.library.emptyCta}
+                </button>
+             </div>
+           )}
         </div>
       )}
 
       {appState === AppState.ABOUT && (
         <div className="max-w-4xl mx-auto py-8 md:py-16 animate-in fade-in slide-in-from-bottom-4 duration-500 px-4">
-           <h2 className="text-4xl md:text-5xl font-black text-slate-800 mb-8">About ExamAI</h2>
-           <div className="bg-white rounded-[2rem] md:rounded-[2.5rem] p-8 md:p-14 shadow-2xl border border-slate-100 space-y-10">
+           <h2 className="text-3xl md:text-4xl font-black text-slate-800 mb-8">{t.about.title}</h2>
+           <div className="bg-white rounded-[2rem] md:rounded-[2.5rem] p-8 md:p-10 shadow-2xl border border-slate-100 space-y-10">
               <section>
-                 <h3 className="text-xl md:text-2xl font-bold text-indigo-600 mb-4 tracking-tight">Our Mission</h3>
+                 <h3 className="text-xl md:text-2xl font-bold text-indigo-600 mb-4 tracking-tight">{t.about.missionTitle}</h3>
                  <p className="text-lg md:text-xl text-slate-600 leading-relaxed">
-                   ExamAI was built to democratize education by giving every student access to a personal examiner. We use state-of-the-art Generative AI to analyze your learning materials and create custom practice environments that feel like the real thing.
+                   {t.about.missionText}
                  </p>
+              </section>
+
+              <section className="bg-indigo-50/50 p-8 rounded-[2rem] border border-indigo-100">
+                 <h3 className="text-xl font-bold text-indigo-700 mb-4">{t.about.langRulesTitle}</h3>
+                 <p className="text-slate-600 mb-4 font-medium">{t.about.langRulesText}</p>
+                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                    <div className="bg-white p-4 rounded-2xl shadow-sm border border-indigo-50">
+                       <p className="text-sm font-bold text-slate-700">{t.about.langRule1}</p>
+                    </div>
+                    <div className="bg-white p-4 rounded-2xl shadow-sm border border-indigo-50">
+                       <p className="text-sm font-bold text-slate-700">{t.about.langRule2}</p>
+                    </div>
+                    <div className="bg-white p-4 rounded-2xl shadow-sm border border-indigo-50">
+                       <p className="text-sm font-bold text-slate-700">{t.about.langRule3}</p>
+                    </div>
+                 </div>
               </section>
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-6 md:gap-8">
                  <div className="p-6 md:p-8 bg-slate-50 rounded-3xl border border-slate-100">
-                    <h4 className="font-bold text-slate-800 text-lg mb-3">Real-time Integrity</h4>
-                    <p className="text-slate-500 text-sm">Our "Auto-Detection" system monitors focus during the test, ensuring a distraction-free practice session that mimics actual exam proctoring.</p>
+                    <h4 className="font-bold text-slate-800 text-lg mb-3">{t.about.feat1Title}</h4>
+                    <p className="text-slate-500 text-sm">{t.about.feat1Text}</p>
                  </div>
                  <div className="p-6 md:p-8 bg-slate-50 rounded-3xl border border-slate-100">
-                    <h4 className="font-bold text-slate-800 text-lg mb-3">Topic Deep Dives</h4>
-                    <p className="text-slate-500 text-sm">Don't just get a score. Our radar-chart analytics show you exactly which topics you've mastered and where you need to spend more time.</p>
+                    <h4 className="font-bold text-slate-800 text-lg mb-3">{t.about.feat2Title}</h4>
+                    <p className="text-slate-500 text-sm">{t.about.feat2Text}</p>
                  </div>
               </div>
 
               <div className="text-center pt-4 border-t border-slate-50">
                 <p className="text-slate-400 font-bold text-sm">
-                  Powered by <span className="text-indigo-600">AKASH VISHWAKARMA</span> | Supported mail ID: <a href="mailto:akashvishwakarma.in@gmail.com" className="text-indigo-600 hover:underline">akashvishwakarma.in@gmail.com</a>
+                  {t.about.poweredBy} <span className="text-indigo-600">AKASH VISHWAKARMA</span> | Supported mail ID: <a href="mailto:akashvishwakarma.in@gmail.com" className="text-indigo-600 hover:underline">akashvishwakarma.in@gmail.com</a>
                 </p>
               </div>
 
@@ -568,7 +957,7 @@ const App: React.FC = () => {
                   onClick={navigateHome}
                   className="w-full sm:w-auto bg-indigo-600 text-white px-8 py-4 rounded-2xl font-bold hover:bg-indigo-700 transition-all shadow-lg active:scale-95"
                 >
-                  Back to Home
+                  {t.about.backHome}
                 </button>
               </div>
            </div>
@@ -583,7 +972,7 @@ const App: React.FC = () => {
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 19l-7-7m0 0l7-7m-7 7h18" />
                 </svg>
               </button>
-              <h2 className="text-4xl md:text-5xl font-black text-slate-800">My Profile</h2>
+              <h2 className="text-3xl md:text-4xl font-black text-slate-800">{t.profile.title}</h2>
            </div>
 
            <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
@@ -610,10 +999,17 @@ const App: React.FC = () => {
                       </div>
                       <input type="file" ref={avatarInputRef} className="hidden" accept="image/*" onChange={handleAvatarUpload} />
                     </div>
-                    <h3 className="text-2xl font-bold text-slate-800 mb-1">{currentUser.displayName || "User"}</h3>
-                    <p className="text-slate-500 font-medium text-sm mb-6">{currentUser.email}</p>
+                    <h3 className="text-2xl font-bold text-slate-800 mb-1">{currentUser.displayName || (currentUser.isAnonymous ? t.nav.guest : "User")}</h3>
+                    <p className="text-slate-500 font-medium text-sm mb-6">{currentUser.email || t.nav.guestAccount}</p>
+                    {currentUser.isAnonymous && (
+                      <div className="mb-6 p-4 bg-indigo-50 rounded-2xl border border-indigo-100">
+                        <p className="text-xs font-bold text-indigo-600 leading-relaxed">
+                          {t.profile.guestWarning}
+                        </p>
+                      </div>
+                    )}
                     <div className="pt-6 border-t border-slate-100">
-                       <p className="text-xs font-black text-slate-400 uppercase tracking-widest mb-4">Quick Icons</p>
+                       <p className="text-xs font-black text-slate-400 uppercase tracking-widest mb-4">{t.profile.quickIcons}</p>
                        <div className="flex justify-center gap-3">
                           {PRESET_AVATARS.map((url, i) => (
                              <button key={i} onClick={() => updateAvatar(url)} className="w-10 h-10 rounded-full border-2 border-slate-100 hover:border-indigo-400 transition-all overflow-hidden">
@@ -628,7 +1024,7 @@ const App: React.FC = () => {
                  <div className="bg-white rounded-[2.5rem] p-8 md:p-12 shadow-xl border border-slate-100">
                     <h4 className="text-2xl font-bold text-slate-800 mb-8 flex items-center gap-3">
                        <span className="w-8 h-8 bg-indigo-100 text-indigo-600 rounded-lg flex items-center justify-center text-base">👤</span>
-                       Profile Settings
+                       {t.profile.settings}
                     </h4>
                     {profileMessage.text && (
                        <div className={`mb-8 p-4 rounded-xl border text-sm font-bold ${profileMessage.type === 'success' ? 'bg-green-50 border-green-100 text-green-600' : 'bg-red-50 border-red-100 text-red-600'}`}>
@@ -638,21 +1034,28 @@ const App: React.FC = () => {
                     <div className="space-y-6">
                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                           <div>
-                             <label className="block text-xs font-black text-slate-400 uppercase tracking-widest mb-3">First Name</label>
+                             <label className="block text-xs font-black text-slate-400 uppercase tracking-widest mb-3">{t.profile.firstName}</label>
                              <input type="text" value={profileName.first} onChange={(e) => setProfileName({...profileName, first: e.target.value})} className="w-full bg-slate-50 border-2 border-slate-100 rounded-2xl px-6 py-4 outline-none focus:border-indigo-500 transition-all" />
                           </div>
                           <div>
-                             <label className="block text-xs font-black text-slate-400 uppercase tracking-widest mb-3">Last Name</label>
+                             <label className="block text-xs font-black text-slate-400 uppercase tracking-widest mb-3">{t.profile.lastName}</label>
                              <input type="text" value={profileName.last} onChange={(e) => setProfileName({...profileName, last: e.target.value})} className="w-full bg-slate-50 border-2 border-slate-100 rounded-2xl px-6 py-4 outline-none focus:border-indigo-500 transition-all" />
                           </div>
                        </div>
                        <div>
-                          <label className="block text-xs font-black text-slate-400 uppercase tracking-widest mb-3">Update Password</label>
-                          <input type="password" placeholder="Enter new password (optional)" value={newPassword} onChange={(e) => setNewPassword(e.target.value)} className="w-full bg-slate-50 border-2 border-slate-100 rounded-2xl px-6 py-4 outline-none focus:border-indigo-500 transition-all" />
+                          <label className="block text-xs font-black text-slate-400 uppercase tracking-widest mb-3">{t.profile.password}</label>
+                          <input 
+                            type="password" 
+                            placeholder={currentUser.isAnonymous ? t.profile.passwordGuest : t.profile.passwordPlaceholder} 
+                            value={newPassword} 
+                            onChange={(e) => setNewPassword(e.target.value)} 
+                            disabled={currentUser.isAnonymous}
+                            className="w-full bg-slate-50 border-2 border-slate-100 rounded-2xl px-6 py-4 outline-none focus:border-indigo-500 transition-all disabled:opacity-50" 
+                          />
                        </div>
                        <div className="pt-4">
                           <button onClick={updateProfileInfo} disabled={profileUpdateLoading} className="w-full bg-indigo-600 text-white py-5 rounded-[2rem] font-black text-lg hover:bg-indigo-700 transition-all shadow-xl flex items-center justify-center disabled:opacity-50">
-                             {profileUpdateLoading ? <div className="w-6 h-6 border-4 border-white border-t-transparent rounded-full animate-spin"></div> : "Save Changes"}
+                             {profileUpdateLoading ? <div className="w-6 h-6 border-4 border-white border-t-transparent rounded-full animate-spin"></div> : t.profile.save}
                           </button>
                        </div>
                     </div>
@@ -662,20 +1065,94 @@ const App: React.FC = () => {
         </div>
       )}
 
-      {appState === AppState.GENERATING && (
+      {appState === AppState.GENERATING && generationError && (
         <div className="flex flex-col items-center justify-center min-h-[60vh] text-center space-y-10 animate-in fade-in zoom-in duration-700 px-4">
-          <div className="relative">
-             <div className="w-24 h-24 md:w-32 md:h-32 border-[8px] md:border-[12px] border-indigo-50 border-t-indigo-600 rounded-full animate-spin shadow-inner"></div>
-             <div className="absolute inset-0 flex items-center justify-center font-black text-xl md:text-2xl text-indigo-600">AI</div>
-          </div>
-          <div className="max-w-md">
-            <h2 className="text-2xl md:text-3xl font-black text-slate-800 mb-4">Generating Your Permanent Exam</h2>
-            <p className="text-sm md:text-base text-slate-500 font-medium">
-               ExamAI is analyzing your material and creating a high-quality test that will be saved to your dashboard for life.
+          <div className="max-w-md bg-white p-8 md:p-12 rounded-[2.5rem] shadow-2xl border border-red-100 animate-in slide-in-from-bottom-4 duration-500">
+            <div className="w-20 h-20 bg-red-50 text-red-600 rounded-3xl flex items-center justify-center text-3xl mx-auto mb-6">
+              ⚠️
+            </div>
+            <h2 className="text-2xl font-black text-slate-800 mb-4">{t.generating.failed}</h2>
+            <p className="text-slate-500 font-medium mb-8">
+              {generationError}
             </p>
+            <button 
+              onClick={() => {
+                setAppState(AppState.IDLE);
+                setGenerationError(null);
+              }}
+              className="w-full bg-slate-800 text-white py-4 rounded-2xl font-bold hover:bg-slate-900 transition-all shadow-lg"
+            >
+              {t.generating.back}
+            </button>
           </div>
-          <div className="max-w-xs md:max-w-sm w-full bg-slate-100 h-3 rounded-full overflow-hidden shadow-inner">
-             <div className="bg-gradient-to-r from-indigo-600 to-violet-600 h-full w-[60%] animate-pulse"></div>
+        </div>
+      )}
+
+      {appState === AppState.READY && (
+        <div className="max-w-2xl mx-auto py-8 md:py-12 animate-in fade-in slide-in-from-bottom-8 duration-700 px-4">
+          <div className="bg-white rounded-[2rem] md:rounded-[2.5rem] p-6 md:p-10 shadow-2xl border border-slate-100 text-center relative overflow-hidden">
+            <div className="absolute top-0 left-0 w-full h-1.5 bg-gradient-to-r from-indigo-600 to-violet-600"></div>
+            
+            <div className="w-16 h-16 bg-indigo-50 text-indigo-600 rounded-2xl flex items-center justify-center text-3xl mx-auto mb-6 shadow-inner">
+              ✅
+            </div>
+            
+            <h2 className="text-xl md:text-3xl font-black text-slate-800 mb-2 tracking-tight">
+              {t.ready.title}
+            </h2>
+            <p className="text-sm md:text-base text-slate-500 font-medium mb-8 max-w-sm mx-auto">
+              {t.ready.subtitle.replace('{title}', config.title)}
+            </p>
+            
+            <div className="grid grid-cols-2 gap-3 mb-8">
+              <div className="bg-slate-50 p-4 rounded-2xl border border-slate-100">
+                <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1">{t.ready.questions}</p>
+                <p className="text-xl font-black text-indigo-600">{questions.length}</p>
+              </div>
+              <div className="bg-slate-50 p-4 rounded-2xl border border-slate-100">
+                <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1">{t.ready.duration}</p>
+                <p className="text-xl font-black text-indigo-600">{config.duration}m</p>
+              </div>
+            </div>
+
+            <div className="mb-8 text-left">
+              <button 
+                onClick={() => setShowReview(!showReview)}
+                className="flex items-center gap-2 text-indigo-600 text-sm font-bold hover:underline mb-3"
+              >
+                {showReview ? 'Hide Question Preview' : 'Preview Questions'}
+                <span className="text-xs">{showReview ? '↑' : '↓'}</span>
+              </button>
+              
+              {showReview && (
+                <div className="bg-slate-50 rounded-xl p-4 max-h-48 overflow-y-auto border border-slate-100 space-y-3">
+                  {questions.map((q, idx) => (
+                    <div key={q.id} className="pb-3 border-b border-slate-200 last:border-0">
+                      <p className="text-xs font-bold text-slate-700 mb-1">Q{idx + 1}: {language === 'hi' && q.hindiQuestion ? q.hindiQuestion : q.question}</p>
+                      <p className="text-[10px] text-slate-400 font-bold uppercase tracking-wider">{q.category} • {q.difficulty}</p>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+            
+            <div className="flex flex-col gap-3">
+              <button 
+                onClick={() => setAppState(AppState.TESTING)}
+                className="w-full bg-indigo-600 text-white py-4 rounded-2xl font-black text-lg md:text-xl hover:bg-indigo-700 transition-all shadow-xl hover:-translate-y-1 active:translate-y-0 active:scale-95 flex items-center justify-center gap-2"
+              >
+                {t.ready.start}
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 md:h-6 md:w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M14 5l7 7m0 0l-7 7m7-7H3" />
+                </svg>
+              </button>
+              <button 
+                onClick={navigateHome}
+                className="text-slate-400 text-sm font-bold hover:text-slate-600 transition-colors py-1"
+              >
+                {t.ready.back}
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -685,6 +1162,7 @@ const App: React.FC = () => {
           questions={questions} 
           durationMinutes={config.duration} 
           onComplete={calculateResults}
+          language={language}
         />
       )}
 
@@ -692,7 +1170,8 @@ const App: React.FC = () => {
         <ResultAnalytics 
           result={result} 
           questions={questions} 
-          onRestart={restart} 
+          onHome={restart}
+          onRetake={retakeTest}
         />
       )}
     </Layout>

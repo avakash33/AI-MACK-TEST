@@ -1,0 +1,60 @@
+// ===============================================================
+// Assumed Data Model
+// ===============================================================
+//
+// Collection: users/{userId}/tests
+// Document ID: auto-generated
+// Fields:
+//   - title: string (required)
+//   - questions: array of objects (required)
+//   - config: object (required)
+//   - createdAt: number (required)
+//   - lastResult: object (optional)
+//
+// ===============================================================
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() &&
+        (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin' ||
+          (request.auth.token.email == "akashawas33@gmail.com" && request.auth.token.email_verified == true)); // Default admin
+    }
+
+    function isValidTest(data) {
+      return data.keys().hasAll(['title', 'questions', 'config', 'createdAt']) &&
+             data.title is string && data.title.size() > 0 && data.title.size() < 200 &&
+             data.questions is list && data.questions.size() > 0 && data.questions.size() <= 1000 &&
+             data.config is map &&
+             data.createdAt is number;
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    match /users/{userId} {
+      allow read, write: if isOwner(userId);
+      
+      match /tests/{testId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId) && isValidTest(request.resource.data);
+        allow update: if isOwner(userId) && isValidTest(request.resource.data);
+        allow delete: if isOwner(userId);
+      }
+    }
+  }
+}

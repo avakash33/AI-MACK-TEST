@@ -1,34 +1,45 @@
 
 import React from 'react';
 import { User } from 'firebase/auth';
+import { translations, Language } from '../translations';
 
 interface LayoutProps {
   children: React.ReactNode;
   onHome: () => void;
   onAbout: () => void;
+  onHistory: () => void;
   onProfile: () => void;
   onSignIn: () => void;
   onSignUp: () => void;
   onSignOut: () => void;
   currentState: string;
   user: User | null;
+  isLocalMode?: boolean;
+  language: Language;
+  onLanguageChange: (lang: Language) => void;
 }
 
 export const Layout: React.FC<LayoutProps> = ({ 
   children, 
   onHome, 
   onAbout, 
+  onHistory,
   onProfile,
   onSignIn, 
   onSignUp,
   onSignOut,
   currentState,
-  user
+  user,
+  isLocalMode,
+  language,
+  onLanguageChange
 }) => {
+  const t = translations[language];
+
   return (
     <div className="min-h-screen flex flex-col">
       <header className="glass sticky top-0 z-50 px-6 py-4 flex items-center justify-between shadow-sm">
-        <div className="flex items-center gap-8">
+        <div className="flex items-center gap-4 md:gap-8">
           <div 
             className="flex items-center gap-2 cursor-pointer group"
             onClick={onHome}
@@ -46,19 +57,43 @@ export const Layout: React.FC<LayoutProps> = ({
               onClick={onHome}
               className={`font-medium transition-colors ${currentState === 'IDLE' ? 'text-indigo-600' : 'text-slate-600 hover:text-indigo-600'}`}
             >
-              Home
+              {t.nav.home}
             </button>
             <button 
               onClick={onAbout}
               className={`font-medium transition-colors ${currentState === 'ABOUT' ? 'text-indigo-600' : 'text-slate-600 hover:text-indigo-600'}`}
             >
-              About
+              {t.nav.about}
             </button>
+            {user && !user.isAnonymous && (
+              <button 
+                onClick={onHistory}
+                className={`font-medium transition-colors ${currentState === 'HISTORY' ? 'text-indigo-600' : 'text-slate-600 hover:text-indigo-600'}`}
+              >
+                {t.nav.history}
+              </button>
+            )}
           </nav>
         </div>
 
         <div className="flex items-center gap-3">
-          {user ? (
+          {/* Language Toggle */}
+          <div className="flex bg-slate-100 p-1 rounded-xl border border-slate-200 mr-2">
+            <button 
+              onClick={() => onLanguageChange('en')}
+              className={`px-3 py-1 rounded-lg text-xs font-bold transition-all ${language === 'en' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
+            >
+              EN
+            </button>
+            <button 
+              onClick={() => onLanguageChange('hi')}
+              className={`px-3 py-1 rounded-lg text-xs font-bold transition-all ${language === 'hi' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
+            >
+              हिन्दी
+            </button>
+          </div>
+
+          {user && !user.isAnonymous ? (
             <div className="flex items-center gap-2 md:gap-4">
               <div 
                 className="flex items-center gap-3 cursor-pointer hover:bg-slate-50 p-1 rounded-xl transition-all"
@@ -87,29 +122,45 @@ export const Layout: React.FC<LayoutProps> = ({
                 onClick={onSignOut}
                 className="bg-slate-100 text-slate-700 px-4 py-2.5 rounded-xl font-bold hover:bg-slate-200 transition-all text-sm whitespace-nowrap"
               >
-                Sign Out
+                {t.nav.signOut}
               </button>
             </div>
           ) : (
-            <>
+            <div className="flex items-center gap-2 md:gap-4">
+              {(isLocalMode || (user && user.isAnonymous)) && (
+                <div 
+                  className="flex items-center gap-3 cursor-pointer hover:bg-slate-50 p-1 rounded-xl transition-all"
+                  onClick={onProfile}
+                >
+                  <div className="w-10 h-10 rounded-full overflow-hidden border-2 border-indigo-100 bg-slate-100 flex items-center justify-center">
+                    <span className="text-indigo-600 font-bold text-lg">G</span>
+                  </div>
+                  <div className="hidden sm:block text-right">
+                    <p className="text-sm font-bold text-slate-700 leading-tight">{t.nav.guest}</p>
+                    <p className="text-[10px] font-medium text-indigo-500">
+                      {isLocalMode ? t.nav.localMode : t.nav.guestAccount}
+                    </p>
+                  </div>
+                </div>
+              )}
               <button 
                 onClick={onSignIn}
                 className="hidden sm:block text-slate-600 hover:text-indigo-600 font-semibold px-4 py-2 transition-colors"
               >
-                Sign In
+                {t.nav.signIn}
               </button>
               <button 
                 onClick={onSignUp}
                 className="bg-indigo-600 text-white px-5 py-2.5 rounded-xl font-bold hover:bg-indigo-700 transition-all shadow-md active:scale-95 text-sm"
               >
-                Sign Up
+                {t.nav.signUp}
               </button>
-            </>
+            </div>
           )}
         </div>
       </header>
       
-      <main className="flex-1 container mx-auto px-4 py-8">
+      <main className="flex-1 max-w-7xl mx-auto w-full px-4 py-8">
         {children}
       </main>
 
@@ -121,14 +172,15 @@ export const Layout: React.FC<LayoutProps> = ({
               <span className="font-bold text-slate-800">ExamAI</span>
             </div>
             <p className="text-slate-500 text-sm max-w-xs">
-              The world's most advanced AI-powered mock test platform for students and professionals.
+              {t.about.missionText.substring(0, 100)}...
             </p>
           </div>
           <div>
             <h4 className="font-bold text-slate-800 mb-4 text-sm uppercase tracking-widest">Platform</h4>
             <ul className="space-y-2 text-sm text-slate-500">
-              <li><button onClick={onHome} className="hover:text-indigo-600">Home</button></li>
-              <li><button onClick={onAbout} className="hover:text-indigo-600">About Us</button></li>
+              <li><button onClick={onHome} className="hover:text-indigo-600">{t.nav.home}</button></li>
+              <li><button onClick={onAbout} className="hover:text-indigo-600">{t.nav.about}</button></li>
+              {user && !user.isAnonymous && <li><button onClick={onHistory} className="hover:text-indigo-600">{t.nav.history}</button></li>}
             </ul>
           </div>
           <div>
@@ -136,20 +188,20 @@ export const Layout: React.FC<LayoutProps> = ({
             <ul className="space-y-2 text-sm text-slate-500">
               {user ? (
                 <>
-                  <li><button onClick={onProfile} className="hover:text-indigo-600">My Profile</button></li>
-                  <li><button onClick={onSignOut} className="hover:text-indigo-600">Sign Out</button></li>
+                  <li><button onClick={onProfile} className="hover:text-indigo-600">{t.profile.title}</button></li>
+                  <li><button onClick={onSignOut} className="hover:text-indigo-600">{t.nav.signOut}</button></li>
                 </>
               ) : (
                 <>
-                  <li><button onClick={onSignIn} className="hover:text-indigo-600">Sign In</button></li>
-                  <li><button onClick={onSignUp} className="hover:text-indigo-600">Sign Up</button></li>
+                  <li><button onClick={onSignIn} className="hover:text-indigo-600">{t.nav.signIn}</button></li>
+                  <li><button onClick={onSignUp} className="hover:text-indigo-600">{t.nav.signUp}</button></li>
                 </>
               )}
             </ul>
           </div>
         </div>
         <div className="mt-12 text-center text-slate-400 text-xs">
-          © 2025 ExamAI Platform. Powered by Gemini Flash 3.
+          © 2026 ExamAI Platform. {t.about.poweredBy} AKASH VISHWAKARMA
         </div>
       </footer>
     </div>

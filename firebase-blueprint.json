@@ -1,0 +1,67 @@
+{
+  "entities": {
+    "Question": {
+      "title": "Question",
+      "description": "A single mock test question",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "question": { "type": "string" },
+        "options": { "type": "array", "items": { "type": "string" } },
+        "correctAnswer": { "type": "integer" },
+        "explanation": { "type": "string" },
+        "category": { "type": "string" },
+        "difficulty": { "type": "string", "enum": ["Easy", "Medium", "Hard"] },
+        "hint": { "type": "string" }
+      },
+      "required": ["id", "question", "options", "correctAnswer", "explanation", "category", "difficulty"]
+    },
+    "TestConfig": {
+      "title": "TestConfig",
+      "description": "Configuration for a mock test",
+      "type": "object",
+      "properties": {
+        "title": { "type": "string" },
+        "duration": { "type": "integer" },
+        "questionCount": { "type": "integer" },
+        "topics": { "type": "string" }
+      },
+      "required": ["title", "duration", "questionCount", "topics"]
+    },
+    "TestResult": {
+      "title": "TestResult",
+      "description": "Result of a completed mock test",
+      "type": "object",
+      "properties": {
+        "score": { "type": "integer" },
+        "totalQuestions": { "type": "integer" },
+        "timeSpent": { "type": "integer" },
+        "answers": { "type": "object" },
+        "timestamp": { "type": "integer" },
+        "anomalies": { "type": "integer" },
+        "categoryBreakdown": { "type": "object" }
+      },
+      "required": ["score", "totalQuestions", "timeSpent", "answers", "timestamp", "anomalies", "categoryBreakdown"]
+    },
+    "SavedTest": {
+      "title": "SavedTest",
+      "description": "A saved mock test for a user",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "title": { "type": "string" },
+        "questions": { "type": "array", "items": { "$ref": "Question" } },
+        "config": { "$ref": "TestConfig" },
+        "createdAt": { "type": "integer" },
+        "lastResult": { "$ref": "TestResult" }
+      },
+      "required": ["id", "title", "questions", "config", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/tests": {
+      "schema": "SavedTest",
+      "description": "User's saved mock tests"
+    }
+  }
+}

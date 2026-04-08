@@ -8,6 +8,11 @@ export interface Question {
   category: string;
   difficulty: 'Easy' | 'Medium' | 'Hard';
   hint?: string;
+  // Hindi support
+  hindiQuestion?: string;
+  hindiOptions?: string[];
+  hindiExplanation?: string;
+  hindiHint?: string;
 }
 
 export interface TestResult {
@@ -36,8 +41,10 @@ export enum AppState {
   CONFIGURING = 'CONFIGURING',
   UPLOADING = 'UPLOADING',
   GENERATING = 'GENERATING',
+  READY = 'READY',
   TESTING = 'TESTING',
-  COMPLETED = 'COMPLETED'
+  COMPLETED = 'COMPLETED',
+  HISTORY = 'HISTORY'
 }
 
 export interface TestConfig {
